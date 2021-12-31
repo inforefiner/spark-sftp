@@ -16,11 +16,14 @@
 package com.springml.spark.sftp
 
 import java.io.File
-import java.util.UUID
+import java.util.{Properties, UUID}
 
+import com.jcraft.jsch.ChannelSftp
+import com.jcraft.jsch.JSch
+import com.jcraft.jsch.JSchException
+import com.jcraft.jsch.SftpException
 import com.springml.sftp.client.SFTPClient
 import com.springml.spark.sftp.util.Utils.ImplicitDataFrameWriter
-
 import org.apache.commons.io.FilenameUtils
 import org.apache.hadoop.fs.Path
 import org.apache.log4j.Logger
@@ -34,6 +37,7 @@ import org.apache.spark.sql.{DataFrame, SQLContext, SaveMode}
 class DefaultSource extends RelationProvider with SchemaRelationProvider with CreatableRelationProvider  {
   @transient val logger = Logger.getLogger(classOf[DefaultSource])
 
+  private val timeout = 60000 //超时数,一分钟
   /**
    * Copy the file from SFTP to local location and then create dataframe using local file
    */
@@ -45,6 +49,10 @@ class DefaultSource extends RelationProvider with SchemaRelationProvider with Cr
    * Copy the file from SFTP to local location and then create dataframe using local file
    */
   override def createRelation(sqlContext: SQLContext, parameters: Map[String, String], schema: StructType) = {
+    val appId = parameters.getOrElse("appId","application")
+    val stepId = parameters.getOrElse("stepId","sftp")
+    val localTempDir = parameters.getOrElse("localTempDir", "/tmp")
+    val newAppId = appId + "_" + stepId
     val username = parameters.get("username")
     val password = parameters.get("password")
     val pemFileLocation = parameters.get("pem")
@@ -80,8 +88,29 @@ class DefaultSource extends RelationProvider with SchemaRelationProvider with Cr
 
     val sftpClient = getSFTPClient(username, password, pemFileLocation, pemPassphrase, host, port,
       cryptoKey, cryptoAlgorithm)
-    val copiedFileLocation = copy(sftpClient, path, tempFolder, copyLatest.toBoolean)
-    val fileLocation = copyToHdfs(sqlContext, copiedFileLocation, hdfsTemp)
+    //新建本地临时存放目录,一个flow如果包含多个sftp source需要区分开
+    var temDir = localTempDir + File.separator + newAppId
+    val target = temDir+ File.separator + FilenameUtils.getName(path)
+
+    var isDir : Boolean = false
+    try{
+      var channel:ChannelSftp = getChannel(getValue(username),getValue(password),host,getValue(port))
+      channel.cd(path)//目录
+      isDir = true
+      if(!new File(target).exists()){
+        new File(target).mkdirs() //拷贝sftp目录到本地系统的话,需要在tmp下提前新建该文件夹
+      }
+    }catch {
+      case e : SftpException => {//文件
+        if(!new File(temDir).exists()) new File(temDir).mkdirs() //单个文件直接拷贝到本地系统的tmp/appId_stepId目录下
+      }
+    }
+    logger.info("transfer sftp file to local system, source {}, target {}", path, target)
+    //拷贝sftp文件或目录到本地系统,返回本地系统的文件全路径或全目录路径
+    val copiedFileLocation = copy(sftpClient, path, temDir, copyLatest.toBoolean)
+    //上传本地系统文件或目录到hdfs,如果是具体文件直接使用该名称,若是目录则会拷贝到该目录下
+    var hdfsTmpDir : String = hdfsTemp + File.separator + newAppId + path
+    val fileLocation = copyToHdfs(sqlContext, copiedFileLocation, hdfsTmpDir, hdfsTemp + File.separator + newAppId)
 
     if (!createDF.toBoolean) {
       logger.info("Returning an empty dataframe after copying files...")
@@ -92,6 +121,14 @@ class DefaultSource extends RelationProvider with SchemaRelationProvider with Cr
     }
   }
 
+  /**
+    * DF sink to SFTP
+    * @param sqlContext
+    * @param mode
+    * @param parameters
+    * @param data
+    * @return
+    */
   override def createRelation(
       sqlContext: SQLContext,
       mode: SaveMode,
@@ -133,15 +170,16 @@ class DefaultSource extends RelationProvider with SchemaRelationProvider with Cr
     return createReturnRelation(data)
   }
   private def copyToHdfs(sqlContext: SQLContext, fileLocation : String,
-                         hdfsTemp : String): String  = {
+                         hdfsTemp : String, deletePath : String): String  = {
     val hadoopConf = sqlContext.sparkContext.hadoopConfiguration
     val hdfsPath = new Path(fileLocation)
     val fs = hdfsPath.getFileSystem(hadoopConf)
     if ("hdfs".equalsIgnoreCase(fs.getScheme)) {
+      logger.info("copy local file to hdfs, source {} ,target {}", fileLocation, hdfsTemp)
       fs.copyFromLocalFile(new Path(fileLocation), new Path(hdfsTemp))
-      val filePath = hdfsTemp + "/" + hdfsPath.getName
-      fs.deleteOnExit(new Path(filePath))
-      return filePath
+//      val filePath = hdfsTemp
+      fs.deleteOnExit(new Path(deletePath))
+      return hdfsTemp
     } else {
       return fileLocation
     }
@@ -152,7 +190,7 @@ class DefaultSource extends RelationProvider with SchemaRelationProvider with Cr
     val hadoopConf = sqlContext.sparkContext.hadoopConfiguration
     val hdfsPath = new Path(hdfsTemp)
     val fs = hdfsPath.getFileSystem(hadoopConf)
-    if ("hdfs".equalsIgnoreCase(fs.getScheme)) {
+    if (!"file".equalsIgnoreCase(fs.getScheme)) {
       fs.copyToLocalFile(new Path(hdfsTemp), new Path(fileLocation))
       fs.deleteOnExit(new Path(hdfsTemp))
       return fileLocation
@@ -283,4 +321,35 @@ class DefaultSource extends RelationProvider with SchemaRelationProvider with Cr
     }
     files(0).getAbsolutePath
   }
+
+
+  def getChannel(username: String, password: String, host: String, port: String): ChannelSftp = {
+    try {
+      val jsch = new JSch // 创建JSch对象
+      // 根据用户名，主机ip，端口获取一个Session对象
+      var session = jsch.getSession(username, host, Integer.valueOf(port))
+      logger.info("Session created...")
+      if (password != null) session.setPassword(password) // 设置密码
+      val config = new Properties
+      config.put("kex", "diffie-hellman-group1-sha1,diffie-hellman-group14-sha1,diffie-hellman-group-exchange-sha1,diffie-hellman-group-exchange-sha256")
+      config.put("StrictHostKeyChecking", "no")
+      session.setConfig(config) // 为Session对象设置properties
+
+      session.setTimeout(timeout) // 设置timeout时间
+
+      session.connect() // 通过Session建立链接
+
+      logger.info("Session connected, Opening Channel...")
+      var channel = session.openChannel("sftp") // 打开SFTP通道
+
+      channel.connect // 建立SFTP通道的连接
+
+      logger.info("Connected successfully to ip :{}, ftpUsername is :{}, return :{}", host, username, channel)
+      channel.asInstanceOf[ChannelSftp]
+    }catch {
+      case e: JSchException => logger.error(e)
+        null
+    }
+  }
+
 }
